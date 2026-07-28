@@ -5,17 +5,24 @@ using Flow.Launcher.Plugin;
 
 namespace Flow.Launcher.Plugin.RecentItems;
 
-public sealed class Main : IAsyncPlugin, IAsyncHomeQuery
+public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
 {
     private const int HomeResultLimit = 15;
     private const int CandidateLimit = 120;
     private const string PluginIcon = "Images\\history.svg";
+    private const string OpenLocationIcon = "Images\\folder-open.svg";
+    private const string PinIcon = "Images\\pin.svg";
+    private const string UnpinIcon = "Images\\pin-off.svg";
 
+    private readonly object _settingsLock = new();
     private PluginInitContext? _context;
+    private PluginSettings _settings = new();
 
     public Task InitAsync(PluginInitContext context)
     {
         _context = context;
+        _settings = context.API.LoadSettingJsonStorage<PluginSettings>();
+        _settings.PinnedPaths ??= [];
         return Task.CompletedTask;
     }
 
@@ -31,6 +38,41 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery
         return Task.Run(
             () => BuildResults(query.Search?.Trim() ?? string.Empty, HomeResultLimit, token),
             token);
+    }
+
+    public List<Result> LoadContextMenus(Result selectedResult)
+    {
+        if (selectedResult.ContextData is not RecentItem item)
+        {
+            return [];
+        }
+
+        List<Result> contextMenus =
+        [
+            new Result
+            {
+                Title = item.IsPinned ? "取消置顶" : "置顶",
+                IcoPath = item.IsPinned ? UnpinIcon : PinIcon,
+                Score = 100,
+                AddSelectedCount = false,
+                Action = _ => TogglePinned(item.TargetPath)
+            }
+        ];
+
+        if (!item.IsDirectory)
+        {
+            contextMenus.Add(new Result
+            {
+                Title = "打开所在位置",
+                SubTitle = "在文件资源管理器中选中此文件",
+                IcoPath = OpenLocationIcon,
+                Score = 90,
+                AddSelectedCount = false,
+                Action = _ => OpenContainingLocation(item.TargetPath)
+            });
+        }
+
+        return contextMenus;
     }
 
     private List<Result> BuildResults(string searchText, int limit, CancellationToken token)
@@ -90,58 +132,98 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery
         }
     }
 
-    private static List<RecentItem> ReadRecentItems(CancellationToken token)
+    private List<RecentItem> ReadRecentItems(CancellationToken token)
     {
         var recentDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
-        if (string.IsNullOrWhiteSpace(recentDirectory) || !Directory.Exists(recentDirectory))
-        {
-            return [];
-        }
-
         var items = new List<RecentItem>();
         var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var links = new DirectoryInfo(recentDirectory)
-            .EnumerateFiles("*.lnk", SearchOption.TopDirectoryOnly)
-            .OrderByDescending(file => file.LastWriteTimeUtc)
-            .Take(CandidateLimit);
+        if (!string.IsNullOrWhiteSpace(recentDirectory) && Directory.Exists(recentDirectory))
+        {
+            var links = new DirectoryInfo(recentDirectory)
+                .EnumerateFiles("*.lnk", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .Take(CandidateLimit);
 
-        foreach (var link in links)
+            foreach (var link in links)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var targetPath = ResolveShortcutTarget(link.FullName);
+                if (string.IsNullOrWhiteSpace(targetPath))
+                {
+                    continue;
+                }
+
+                targetPath = Environment.ExpandEnvironmentVariables(targetPath.Trim());
+
+                var isDirectory = Directory.Exists(targetPath);
+                var isFile = !isDirectory && File.Exists(targetPath);
+                if ((!isDirectory && !isFile) || !seenTargets.Add(targetPath))
+                {
+                    continue;
+                }
+
+                items.Add(CreateRecentItem(
+                    targetPath,
+                    link.LastWriteTime,
+                    isDirectory,
+                    isPinned: false));
+            }
+        }
+
+        List<string> pinnedPaths;
+        lock (_settingsLock)
+        {
+            var savedPinnedPaths = _settings.PinnedPaths ??= [];
+            pinnedPaths = [.. savedPinnedPaths];
+        }
+
+        var recentByPath = items.ToDictionary(
+            item => item.TargetPath,
+            StringComparer.OrdinalIgnoreCase);
+        var pinnedItems = new List<RecentItem>();
+
+        foreach (var pinnedPath in pinnedPaths)
         {
             token.ThrowIfCancellationRequested();
 
-            var targetPath = ResolveShortcutTarget(link.FullName);
-            if (string.IsNullOrWhiteSpace(targetPath))
+            if (recentByPath.Remove(pinnedPath, out var recentItem))
             {
+                pinnedItems.Add(recentItem with { IsPinned = true });
                 continue;
             }
 
-            targetPath = Environment.ExpandEnvironmentVariables(targetPath.Trim());
-
-            var isDirectory = Directory.Exists(targetPath);
-            var isFile = !isDirectory && File.Exists(targetPath);
-            if ((!isDirectory && !isFile) || !seenTargets.Add(targetPath))
+            var isDirectory = Directory.Exists(pinnedPath);
+            if (isDirectory || File.Exists(pinnedPath))
             {
-                continue;
+                pinnedItems.Add(CreateRecentItem(
+                    pinnedPath,
+                    DateTime.MinValue,
+                    isDirectory,
+                    isPinned: true));
             }
-
-            var title = isDirectory
-                ? new DirectoryInfo(targetPath).Name
-                : Path.GetFileName(targetPath);
-
-            if (string.IsNullOrWhiteSpace(title))
-            {
-                title = targetPath;
-            }
-
-            items.Add(new RecentItem(
-                title,
-                targetPath,
-                link.LastWriteTime,
-                isDirectory));
         }
 
-        return items;
+        return [.. pinnedItems, .. items.Where(item => recentByPath.ContainsKey(item.TargetPath))];
+    }
+
+    private static RecentItem CreateRecentItem(
+        string targetPath,
+        DateTime lastUsed,
+        bool isDirectory,
+        bool isPinned)
+    {
+        var title = isDirectory
+            ? new DirectoryInfo(targetPath).Name
+            : Path.GetFileName(targetPath);
+
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            title = targetPath;
+        }
+
+        return new RecentItem(title, targetPath, lastUsed, isDirectory, isPinned);
     }
 
     private static string? ResolveShortcutTarget(string shortcutPath)
@@ -204,16 +286,20 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery
     private static Result CreateResult(RecentItem item, int index)
     {
         var kind = item.IsDirectory ? "文件夹" : "文件";
+        var status = item.IsPinned
+            ? $"已置顶 · {kind} · {item.TargetPath}"
+            : $"最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}";
 
         return new Result
         {
             Title = item.Title,
-            SubTitle = $"最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}",
+            SubTitle = status,
             IcoPath = item.TargetPath,
             CopyText = item.TargetPath,
             Score = 10_000 - index,
             AddSelectedCount = false,
             RecordKey = item.TargetPath,
+            ContextData = item,
             Preview = new Result.PreviewInfo
             {
                 FilePath = item.TargetPath
@@ -239,9 +325,75 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery
         }
     }
 
+    private bool TogglePinned(string targetPath)
+    {
+        lock (_settingsLock)
+        {
+            var pinnedPaths = _settings.PinnedPaths ??= [];
+            var existingIndex = pinnedPaths.FindIndex(
+                path => string.Equals(path, targetPath, StringComparison.OrdinalIgnoreCase));
+
+            if (existingIndex >= 0)
+            {
+                pinnedPaths.RemoveAt(existingIndex);
+            }
+            else
+            {
+                pinnedPaths.Insert(0, targetPath);
+            }
+
+            _context?.API.SaveSettingJsonStorage<PluginSettings>();
+        }
+
+        _context?.API.ReQuery(reselect: false);
+        return false;
+    }
+
+    private bool OpenContainingLocation(string targetPath)
+    {
+        try
+        {
+            if (_context is not null)
+            {
+                var directoryPath = Path.GetDirectoryName(targetPath);
+
+                if (string.IsNullOrWhiteSpace(directoryPath))
+                {
+                    return false;
+                }
+
+                _context.API.OpenDirectory(
+                    directoryPath,
+                    targetPath);
+                return true;
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                UseShellExecute = true
+            };
+
+            startInfo.ArgumentList.Add($"/select,{targetPath}");
+
+            Process.Start(startInfo);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public sealed class PluginSettings
+    {
+        public List<string>? PinnedPaths { get; set; } = [];
+    }
+
     private sealed record RecentItem(
         string Title,
         string TargetPath,
         DateTime LastUsed,
-        bool IsDirectory);
+        bool IsDirectory,
+        bool IsPinned);
 }
