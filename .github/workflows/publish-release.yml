@@ -59,8 +59,8 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.value }}"
-          $output = "artifacts/RecentFilesAndFolders-$version"
-          $archive = "artifacts/RecentFilesAndFolders-$version.zip"
+          $output = "artifacts/HistoryBox-$version"
+          $archive = "artifacts/HistoryBox-$version.zip"
 
           New-Item -ItemType Directory -Path "$output/Images" -Force | Out-Null
           Copy-Item `
@@ -72,8 +72,8 @@ jobs:
           Copy-Item "Flow.Launcher.Plugin.RecentItems/plugin.json" $output
           Copy-Item "Flow.Launcher.Plugin.RecentItems/README.md" $output
           Copy-Item `
-            "Flow.Launcher.Plugin.RecentItems/Images/history.svg" `
-            "$output/Images/history.svg"
+            "Flow.Launcher.Plugin.RecentItems/Images/*.svg" `
+            "$output/Images"
 
           Compress-Archive -Path "$output/*" -DestinationPath $archive -Force
           Get-FileHash $archive -Algorithm SHA256 |
@@ -84,6 +84,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            artifacts/RecentFilesAndFolders-${{ steps.version.outputs.value }}.zip
+            artifacts/HistoryBox-${{ steps.version.outputs.value }}.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true

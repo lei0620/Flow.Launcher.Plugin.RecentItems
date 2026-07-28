@@ -19,6 +19,9 @@
 
   <ItemGroup>
     <None Include="plugin.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Images\folder-open.svg" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="Images\history.svg" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Images\pin-off.svg" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Images\pin.svg" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
