@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.pdb
+
+release/
+备份/
+
+AGENTS.md
+PROJECT_CONTEXT.md
+ROADMAP.md

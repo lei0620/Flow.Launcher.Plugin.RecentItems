@@ -1,0 +1,89 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Read plugin version
+        id: version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content "Flow.Launcher.Plugin.RecentItems/plugin.json" -Raw |
+            ConvertFrom-Json
+          "value=$($manifest.Version)" >> $env:GITHUB_OUTPUT
+
+          if ("v$($manifest.Version)" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match manifest version $($manifest.Version)."
+          }
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore `
+            "Flow.Launcher.Plugin.RecentItems/Flow.Launcher.Plugin.RecentItems.csproj"
+          dotnet restore `
+            "tests/RecentItems.SmokeTest/RecentItems.SmokeTest.csproj"
+
+      - name: Build
+        run: >
+          dotnet build
+          Flow.Launcher.Plugin.RecentItems/Flow.Launcher.Plugin.RecentItems.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Run smoke test
+        run: >
+          dotnet run
+          --project tests/RecentItems.SmokeTest/RecentItems.SmokeTest.csproj
+          --configuration Release
+          --no-restore
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.value }}"
+          $output = "artifacts/RecentFilesAndFolders-$version"
+          $archive = "artifacts/RecentFilesAndFolders-$version.zip"
+
+          New-Item -ItemType Directory -Path "$output/Images" -Force | Out-Null
+          Copy-Item `
+            "Flow.Launcher.Plugin.RecentItems/bin/Release/Flow.Launcher.Plugin.RecentItems.dll" `
+            $output
+          Copy-Item `
+            "Flow.Launcher.Plugin.RecentItems/bin/Release/Flow.Launcher.Plugin.RecentItems.deps.json" `
+            $output
+          Copy-Item "Flow.Launcher.Plugin.RecentItems/plugin.json" $output
+          Copy-Item "Flow.Launcher.Plugin.RecentItems/README.md" $output
+          Copy-Item `
+            "Flow.Launcher.Plugin.RecentItems/Images/history.svg" `
+            "$output/Images/history.svg"
+
+          Compress-Archive -Path "$output/*" -DestinationPath $archive -Force
+          Get-FileHash $archive -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($archive))" } |
+            Set-Content "artifacts/SHA256SUMS.txt"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/RecentFilesAndFolders-${{ steps.version.outputs.value }}.zip
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
