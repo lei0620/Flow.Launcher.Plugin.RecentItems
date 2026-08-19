@@ -1,5 +1,6 @@
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using Flow.Launcher.Plugin;
 using Flow.Launcher.Plugin.RecentItems;
 
@@ -9,10 +10,16 @@ var testRoot = Path.Combine(
 var firstFolder = Path.Combine(testRoot, "Pinned-A");
 var secondFolder = Path.Combine(testRoot, "Pinned-B");
 var filePath = Path.Combine(testRoot, "not-a-home-folder.txt");
+var liveRecentFile = Path.Combine(testRoot, "live-recent-file.txt");
+var recentDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
+var recentShortcut = Path.Combine(
+    recentDirectory,
+    $"HistoryBoxSmoke-{Guid.NewGuid():N}.lnk");
 
 Directory.CreateDirectory(firstFolder);
 Directory.CreateDirectory(secondFolder);
 File.WriteAllText(filePath, "smoke test");
+File.WriteAllText(liveRecentFile, "live refresh smoke test");
 
 try
 {
@@ -116,6 +123,36 @@ try
     Console.WriteLine("SEARCH_RECORD_KEY_ISOLATION=PASS");
     Console.WriteLine("PATH_NORMALIZATION=PASS");
 
+    CreateShortcut(recentShortcut, liveRecentFile);
+    File.SetLastWriteTime(recentShortcut, DateTime.Now);
+    List<Result> refreshedHomeResults = [];
+    Result? refreshedRecentResult = null;
+
+    for (var attempt = 0; attempt < 20 && refreshedRecentResult is null; attempt++)
+    {
+        await InvokePrivateAsync(plugin, "RefreshHomeRecentItemsAsync", false);
+        refreshedHomeResults = (List<Result>?)InvokePrivate(plugin, "BuildHomeResults") ?? [];
+        refreshedRecentResult = refreshedHomeResults.SingleOrDefault(result => string.Equals(
+            result.CopyText,
+            liveRecentFile,
+            StringComparison.OrdinalIgnoreCase));
+
+        if (refreshedRecentResult is null)
+        {
+            await Task.Delay(100);
+        }
+    }
+
+    if (refreshedRecentResult is null ||
+        !refreshedRecentResult.SubTitle.StartsWith("最近使用：", StringComparison.Ordinal) ||
+        refreshedHomeResults.Take(3).Any(result =>
+            !result.SubTitle.StartsWith("已固定到主页", StringComparison.Ordinal)))
+    {
+        throw new InvalidOperationException("主页没有保持固定项目优先并实时补充最近项目。");
+    }
+
+    Console.WriteLine("HOME_LIVE_RECENT_REFRESH=PASS");
+
     var manifestPath = Path.Combine(
         AppContext.BaseDirectory,
         "..", "..", "..", "..", "..",
@@ -134,7 +171,7 @@ try
     }
 
     if (manifest.RootElement.GetProperty("Author").GetString() != "lei" ||
-        manifest.RootElement.GetProperty("Version").GetString() != "1.2.4")
+        manifest.RootElement.GetProperty("Version").GetString() != "1.2.5")
     {
         throw new InvalidOperationException("插件作者或版本元数据不正确。");
     }
@@ -144,6 +181,11 @@ try
 }
 finally
 {
+    if (File.Exists(recentShortcut))
+    {
+        File.Delete(recentShortcut);
+    }
+
     if (Directory.Exists(testRoot))
     {
         Directory.Delete(testRoot, recursive: true);
@@ -170,6 +212,65 @@ static object? InvokePrivate(Main plugin, string methodName, params object[] arg
         ?? throw new InvalidOperationException($"找不到私有方法：{methodName}");
 
     return method.Invoke(plugin, arguments);
+}
+
+static async Task InvokePrivateAsync(
+    Main plugin,
+    string methodName,
+    params object[] arguments)
+{
+    if (InvokePrivate(plugin, methodName, arguments) is not Task task)
+    {
+        throw new InvalidOperationException($"私有方法没有返回 Task：{methodName}");
+    }
+
+    await task;
+}
+
+static void CreateShortcut(string shortcutPath, string targetPath)
+{
+    object? shell = null;
+    object? shortcut = null;
+
+    try
+    {
+        var shellType = Type.GetTypeFromProgID("WScript.Shell")
+            ?? throw new InvalidOperationException("找不到 WScript.Shell。");
+        shell = Activator.CreateInstance(shellType)
+            ?? throw new InvalidOperationException("无法创建 WScript.Shell。");
+        shortcut = shellType.InvokeMember(
+            "CreateShortcut",
+            BindingFlags.InvokeMethod,
+            binder: null,
+            target: shell,
+            args: [shortcutPath])
+            ?? throw new InvalidOperationException("无法创建测试快捷方式。");
+        var shortcutType = shortcut.GetType();
+        shortcutType.InvokeMember(
+            "TargetPath",
+            BindingFlags.SetProperty,
+            binder: null,
+            target: shortcut,
+            args: [targetPath]);
+        shortcutType.InvokeMember(
+            "Save",
+            BindingFlags.InvokeMethod,
+            binder: null,
+            target: shortcut,
+            args: null);
+    }
+    finally
+    {
+        if (shortcut is not null && Marshal.IsComObject(shortcut))
+        {
+            Marshal.FinalReleaseComObject(shortcut);
+        }
+
+        if (shell is not null && Marshal.IsComObject(shell))
+        {
+            Marshal.FinalReleaseComObject(shell);
+        }
+    }
 }
 
 static Query CreateQuery(string search)

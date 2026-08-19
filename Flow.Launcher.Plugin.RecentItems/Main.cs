@@ -18,9 +18,12 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
     private const string UnpinIcon = "Images\\pin-off.svg";
 
     private readonly object _settingsLock = new();
+    private readonly object _homeRecentLock = new();
+    private readonly SemaphoreSlim _homeRefreshGate = new(1, 1);
     private PluginInitContext? _context;
     private PluginSettings _settings = new();
     private List<RecentItem> _homePinnedItems = [];
+    private List<RecentItem> _homeRecentItems = [];
 
     public Task InitAsync(PluginInitContext context)
     {
@@ -29,13 +32,16 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         _settings.PinnedPaths ??= [];
         NormalizePinnedSettings();
         RefreshHomePinnedItems();
+        _ = RefreshHomeRecentItemsAsync(requestRequery: false);
         return Task.CompletedTask;
     }
 
     public Task<List<Result>> HomeQueryAsync(CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        return Task.FromResult(BuildHomeResults());
+        var results = BuildHomeResults();
+        _ = RefreshHomeRecentItemsAsync(requestRequery: true);
+        return Task.FromResult(results);
     }
 
     public Task<List<Result>> QueryAsync(Query query, CancellationToken token)
@@ -87,7 +93,18 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             pinnedItems = [.. _homePinnedItems];
         }
 
+        List<RecentItem> recentItems;
+        lock (_homeRecentLock)
+        {
+            recentItems = [.. _homeRecentItems];
+        }
+
+        var pinnedPaths = pinnedItems
+            .Select(item => item.TargetPath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         return pinnedItems
+            .Concat(recentItems.Where(item => !pinnedPaths.Contains(item.TargetPath)))
             .Take(HomeResultLimit)
             .Select((item, index) => CreateResult(item, index, ResultSurface.Home))
             .ToList();
@@ -152,6 +169,44 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
 
     private List<RecentItem> ReadSearchItems(CancellationToken token)
     {
+        var items = ReadWindowsRecentItems(token);
+
+        List<RecentItem> pinnedItems;
+        lock (_settingsLock)
+        {
+            pinnedItems = [.. _homePinnedItems];
+        }
+
+        var recentByPath = items.ToDictionary(
+            item => item.TargetPath,
+            StringComparer.OrdinalIgnoreCase);
+        var pinnedOnlyItems = new List<RecentItem>();
+
+        foreach (var pinnedItem in pinnedItems)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (recentByPath.TryGetValue(pinnedItem.TargetPath, out var recentItem))
+            {
+                var index = items.FindIndex(item => string.Equals(
+                    item.TargetPath,
+                    pinnedItem.TargetPath,
+                    StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    items[index] = recentItem with { IsHomePinned = true };
+                }
+                continue;
+            }
+
+            pinnedOnlyItems.Add(pinnedItem);
+        }
+
+        return [.. items, .. pinnedOnlyItems];
+    }
+
+    private static List<RecentItem> ReadWindowsRecentItems(CancellationToken token)
+    {
         var recentDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
         var items = new List<RecentItem>();
         var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -194,38 +249,72 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             }
         }
 
-        List<RecentItem> pinnedItems;
-        lock (_settingsLock)
+        return items;
+    }
+
+    private async Task RefreshHomeRecentItemsAsync(bool requestRequery)
+    {
+        if (!await _homeRefreshGate.WaitAsync(0).ConfigureAwait(false))
         {
-            pinnedItems = [.. _homePinnedItems];
+            return;
         }
 
-        var recentByPath = items.ToDictionary(
-            item => item.TargetPath,
-            StringComparer.OrdinalIgnoreCase);
-        var pinnedOnlyItems = new List<RecentItem>();
-
-        foreach (var pinnedItem in pinnedItems)
+        try
         {
-            token.ThrowIfCancellationRequested();
+            var latestItems = await Task.Run(
+                    () => ReadWindowsRecentItems(CancellationToken.None))
+                .ConfigureAwait(false);
+            bool changed;
 
-            if (recentByPath.TryGetValue(pinnedItem.TargetPath, out var recentItem))
+            lock (_homeRecentLock)
             {
-                var index = items.FindIndex(item => string.Equals(
-                    item.TargetPath,
-                    pinnedItem.TargetPath,
-                    StringComparison.OrdinalIgnoreCase));
-                if (index >= 0)
+                changed = !RecentItemsEqual(_homeRecentItems, latestItems);
+                if (changed)
                 {
-                    items[index] = recentItem with { IsHomePinned = true };
+                    _homeRecentItems = latestItems;
                 }
-                continue;
             }
 
-            pinnedOnlyItems.Add(pinnedItem);
+            if (changed && requestRequery)
+            {
+                _context?.API.ReQuery(reselect: false);
+            }
+        }
+        catch (Exception exception)
+        {
+            _context?.API.LogException(
+                nameof(RecentItems),
+                "刷新主页最近项目失败",
+                exception);
+        }
+        finally
+        {
+            _homeRefreshGate.Release();
+        }
+    }
+
+    private static bool RecentItemsEqual(
+        IReadOnlyList<RecentItem> current,
+        IReadOnlyList<RecentItem> latest)
+    {
+        if (current.Count != latest.Count)
+        {
+            return false;
         }
 
-        return [.. items, .. pinnedOnlyItems];
+        for (var index = 0; index < current.Count; index++)
+        {
+            if (!string.Equals(
+                    current[index].TargetPath,
+                    latest[index].TargetPath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                current[index].LastUsed != latest[index].LastUsed)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static RecentItem CreateRecentItem(
@@ -359,7 +448,9 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
     {
         var kind = item.IsDirectory ? "文件夹" : "文件";
         var status = surface == ResultSurface.Home
-            ? $"已固定到主页 · {kind} · {item.TargetPath}"
+            ? item.IsHomePinned
+                ? $"已固定到主页 · {kind} · {item.TargetPath}"
+                : $"最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}"
             : item.IsHomePinned
                 ? $"History Box 搜索 · 已固定到主页 · {kind} · {item.TargetPath}"
                 : $"History Box 搜索 · 最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}";
