@@ -9,6 +9,9 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
 {
     private const int HomeResultLimit = 15;
     private const int CandidateLimit = 120;
+    private const int HomeScoreBase = 1_000_000;
+    private const int SearchScoreBase = 100_000;
+    private const string RecordKeyPrefix = "history-box";
     private const string PluginIcon = "Images\\history.svg";
     private const string OpenLocationIcon = "Images\\folder-open.svg";
     private const string PinIcon = "Images\\pin.svg";
@@ -17,26 +20,28 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
     private readonly object _settingsLock = new();
     private PluginInitContext? _context;
     private PluginSettings _settings = new();
+    private List<RecentItem> _homePinnedItems = [];
 
     public Task InitAsync(PluginInitContext context)
     {
         _context = context;
         _settings = context.API.LoadSettingJsonStorage<PluginSettings>();
         _settings.PinnedPaths ??= [];
+        NormalizePinnedSettings();
+        RefreshHomePinnedItems();
         return Task.CompletedTask;
     }
 
     public Task<List<Result>> HomeQueryAsync(CancellationToken token)
     {
-        return Task.Run(
-            () => BuildResults(searchText: string.Empty, HomeResultLimit, token),
-            token);
+        token.ThrowIfCancellationRequested();
+        return Task.FromResult(BuildHomeResults());
     }
 
     public Task<List<Result>> QueryAsync(Query query, CancellationToken token)
     {
         return Task.Run(
-            () => BuildResults(query.Search?.Trim() ?? string.Empty, HomeResultLimit, token),
+            () => BuildSearchResults(query.Search?.Trim() ?? string.Empty, HomeResultLimit, token),
             token);
     }
 
@@ -47,17 +52,16 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             return [];
         }
 
-        List<Result> contextMenus =
-        [
-            new Result
-            {
-                Title = item.IsPinned ? "取消置顶" : "置顶",
-                IcoPath = item.IsPinned ? UnpinIcon : PinIcon,
-                Score = 100,
-                AddSelectedCount = false,
-                Action = _ => TogglePinned(item.TargetPath)
-            }
-        ];
+        List<Result> contextMenus = [];
+
+        contextMenus.Add(new Result
+        {
+            Title = item.IsHomePinned ? "从主页移除" : "固定到主页",
+            IcoPath = item.IsHomePinned ? UnpinIcon : PinIcon,
+            Score = 100,
+            AddSelectedCount = false,
+            Action = _ => ToggleHomePinned(item.TargetPath)
+        });
 
         if (!item.IsDirectory)
         {
@@ -75,11 +79,25 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         return contextMenus;
     }
 
-    private List<Result> BuildResults(string searchText, int limit, CancellationToken token)
+    private List<Result> BuildHomeResults()
+    {
+        List<RecentItem> pinnedItems;
+        lock (_settingsLock)
+        {
+            pinnedItems = [.. _homePinnedItems];
+        }
+
+        return pinnedItems
+            .Take(HomeResultLimit)
+            .Select((item, index) => CreateResult(item, index, ResultSurface.Home))
+            .ToList();
+    }
+
+    private List<Result> BuildSearchResults(string searchText, int limit, CancellationToken token)
     {
         try
         {
-            var items = ReadRecentItems(token);
+            var items = ReadSearchItems(token);
 
             if (!string.IsNullOrWhiteSpace(searchText))
             {
@@ -92,7 +110,7 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
 
             var results = items
                 .Take(limit)
-                .Select((item, index) => CreateResult(item, index))
+                .Select((item, index) => CreateResult(item, index, ResultSurface.Search))
                 .ToList();
 
             if (results.Count == 0)
@@ -132,7 +150,7 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         }
     }
 
-    private List<RecentItem> ReadRecentItems(CancellationToken token)
+    private List<RecentItem> ReadSearchItems(CancellationToken token)
     {
         var recentDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
         var items = new List<RecentItem>();
@@ -155,7 +173,11 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
                     continue;
                 }
 
-                targetPath = Environment.ExpandEnvironmentVariables(targetPath.Trim());
+                targetPath = NormalizePath(targetPath);
+                if (string.IsNullOrWhiteSpace(targetPath))
+                {
+                    continue;
+                }
 
                 var isDirectory = Directory.Exists(targetPath);
                 var isFile = !isDirectory && File.Exists(targetPath);
@@ -168,51 +190,49 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
                     targetPath,
                     link.LastWriteTime,
                     isDirectory,
-                    isPinned: false));
+                    isHomePinned: false));
             }
         }
 
-        List<string> pinnedPaths;
+        List<RecentItem> pinnedItems;
         lock (_settingsLock)
         {
-            var savedPinnedPaths = _settings.PinnedPaths ??= [];
-            pinnedPaths = [.. savedPinnedPaths];
+            pinnedItems = [.. _homePinnedItems];
         }
 
         var recentByPath = items.ToDictionary(
             item => item.TargetPath,
             StringComparer.OrdinalIgnoreCase);
-        var pinnedItems = new List<RecentItem>();
+        var pinnedOnlyItems = new List<RecentItem>();
 
-        foreach (var pinnedPath in pinnedPaths)
+        foreach (var pinnedItem in pinnedItems)
         {
             token.ThrowIfCancellationRequested();
 
-            if (recentByPath.Remove(pinnedPath, out var recentItem))
+            if (recentByPath.TryGetValue(pinnedItem.TargetPath, out var recentItem))
             {
-                pinnedItems.Add(recentItem with { IsPinned = true });
+                var index = items.FindIndex(item => string.Equals(
+                    item.TargetPath,
+                    pinnedItem.TargetPath,
+                    StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    items[index] = recentItem with { IsHomePinned = true };
+                }
                 continue;
             }
 
-            var isDirectory = Directory.Exists(pinnedPath);
-            if (isDirectory || File.Exists(pinnedPath))
-            {
-                pinnedItems.Add(CreateRecentItem(
-                    pinnedPath,
-                    DateTime.MinValue,
-                    isDirectory,
-                    isPinned: true));
-            }
+            pinnedOnlyItems.Add(pinnedItem);
         }
 
-        return [.. pinnedItems, .. items.Where(item => recentByPath.ContainsKey(item.TargetPath))];
+        return [.. items, .. pinnedOnlyItems];
     }
 
     private static RecentItem CreateRecentItem(
         string targetPath,
         DateTime lastUsed,
         bool isDirectory,
-        bool isPinned)
+        bool isHomePinned)
     {
         var title = isDirectory
             ? new DirectoryInfo(targetPath).Name
@@ -223,7 +243,59 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             title = targetPath;
         }
 
-        return new RecentItem(title, targetPath, lastUsed, isDirectory, isPinned);
+        return new RecentItem(title, targetPath, lastUsed, isDirectory, isHomePinned);
+    }
+
+    private void NormalizePinnedSettings()
+    {
+        lock (_settingsLock)
+        {
+            var normalizedPaths = (_settings.PinnedPaths ?? [])
+                .Select(NormalizePath)
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            _settings.PinnedPaths = normalizedPaths;
+        }
+    }
+
+    private void RefreshHomePinnedItems()
+    {
+        lock (_settingsLock)
+        {
+            _homePinnedItems = (_settings.PinnedPaths ?? [])
+                .Where(path => Directory.Exists(path) || File.Exists(path))
+                .Select(path => CreateRecentItem(
+                    path,
+                    DateTime.MinValue,
+                    isDirectory: Directory.Exists(path),
+                    isHomePinned: true))
+                .ToList();
+        }
+    }
+
+    private static string NormalizePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            var expandedPath = Environment.ExpandEnvironmentVariables(path.Trim());
+            var fullPath = Path.GetFullPath(expandedPath);
+            var rootPath = Path.GetPathRoot(fullPath);
+
+            return string.Equals(fullPath, rootPath, StringComparison.OrdinalIgnoreCase)
+                ? fullPath
+                : fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch
+        {
+            return path.Trim();
+        }
     }
 
     private static string? ResolveShortcutTarget(string shortcutPath)
@@ -283,12 +355,15 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         }
     }
 
-    private static Result CreateResult(RecentItem item, int index)
+    private static Result CreateResult(RecentItem item, int index, ResultSurface surface)
     {
         var kind = item.IsDirectory ? "文件夹" : "文件";
-        var status = item.IsPinned
-            ? $"已置顶 · {kind} · {item.TargetPath}"
-            : $"最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}";
+        var status = surface == ResultSurface.Home
+            ? $"已固定到主页 · {kind} · {item.TargetPath}"
+            : item.IsHomePinned
+                ? $"History Box 搜索 · 已固定到主页 · {kind} · {item.TargetPath}"
+                : $"History Box 搜索 · 最近使用：{item.LastUsed:MM-dd HH:mm} · {kind} · {item.TargetPath}";
+        var surfaceKey = surface == ResultSurface.Home ? "home" : "search";
 
         return new Result
         {
@@ -296,9 +371,11 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             SubTitle = status,
             IcoPath = item.TargetPath,
             CopyText = item.TargetPath,
-            Score = 10_000 - index,
+            Score = surface == ResultSurface.Home
+                ? HomeScoreBase - index
+                : SearchScoreBase - index,
             AddSelectedCount = false,
-            RecordKey = item.TargetPath,
+            RecordKey = $"{RecordKeyPrefix}|{surfaceKey}|{item.TargetPath}",
             ContextData = item,
             Preview = new Result.PreviewInfo
             {
@@ -325,8 +402,10 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         }
     }
 
-    private bool TogglePinned(string targetPath)
+    private bool ToggleHomePinned(string targetPath)
     {
+        targetPath = NormalizePath(targetPath);
+
         lock (_settingsLock)
         {
             var pinnedPaths = _settings.PinnedPaths ??= [];
@@ -337,11 +416,12 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
             {
                 pinnedPaths.RemoveAt(existingIndex);
             }
-            else
+            else if (Directory.Exists(targetPath) || File.Exists(targetPath))
             {
                 pinnedPaths.Insert(0, targetPath);
             }
 
+            RefreshHomePinnedItems();
             _context?.API.SaveSettingJsonStorage<PluginSettings>();
         }
 
@@ -395,5 +475,11 @@ public sealed class Main : IAsyncPlugin, IAsyncHomeQuery, IContextMenu
         string TargetPath,
         DateTime LastUsed,
         bool IsDirectory,
-        bool IsPinned);
+        bool IsHomePinned);
+
+    private enum ResultSurface
+    {
+        Home,
+        Search
+    }
 }
