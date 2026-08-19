@@ -133,7 +133,14 @@ try
         throw new InvalidOperationException("插件没有同时保留全局搜索和 rf 显式入口。");
     }
 
+    if (manifest.RootElement.GetProperty("Author").GetString() != "lei" ||
+        manifest.RootElement.GetProperty("Version").GetString() != "1.2.4")
+    {
+        throw new InvalidOperationException("插件作者或版本元数据不正确。");
+    }
+
     Console.WriteLine("GLOBAL_AND_RF_KEYWORDS=PASS");
+    Console.WriteLine("AUTHOR_METADATA=PASS");
 }
 finally
 {
